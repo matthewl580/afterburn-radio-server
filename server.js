@@ -3,6 +3,7 @@ const admin = require("firebase-admin");
 const multer = require("multer");
 const cors = require("cors");
 const { parseBuffer } = require("music-metadata");
+const { randomUUID } = require("crypto");
 
 // Initialize Firebase Admin using Render environment variable
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_KEY_JSON);
@@ -25,10 +26,11 @@ const STREAM_PACKET_SIZE_BYTES = 8 * 1024;
 let songLibrary = []; // Array of { id, title, author, filePath, createdAt }
 let playlistQueue = []; // Array of song IDs representing the upcoming rotation
 let activeListeners = []; // Array of Express response streams connected to /stream
+const modeListeners = new Set();
 let currentPlayback = null; // { songId, currentChunkIndex, nextChunkIndex, positionSeconds }
 
 let currentStreamMode = "AUTODJ"; // 'AUTODJ' or 'LIVE'
-let liveBroadcastBuffer = []; // Chunks for live broadcast interruption
+let currentBroadcast = null;
 
 // --- ID TRANSLATION & HELPER UTILITIES ---
 
@@ -87,6 +89,59 @@ function createTrackChunks(fileSize, durationSeconds) {
 
 function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function getBroadcastId(req) {
+  return req.get("X-Broadcast-Id") || req.body?.broadcastId;
+}
+
+function getAudioFormat(body = {}) {
+  const requestedFormat = body?.audioFormat || body || {};
+  const mimeType = requestedFormat.mimeType || "audio/mpeg";
+  const channels = requestedFormat.channels ?? 1;
+  const sampleRate = requestedFormat.sampleRate ?? 44100;
+  const bitrate = requestedFormat.bitrate ?? 128000;
+
+  if (mimeType !== "audio/mpeg") {
+    return { error: "Live broadcasts must use audio/mpeg" };
+  }
+  if (channels !== 1) {
+    return { error: "Live broadcasts must be mono (1 channel)" };
+  }
+  if (!Number.isInteger(sampleRate) || sampleRate < 8000 || sampleRate > 192000) {
+    return { error: "sampleRate must be an integer between 8000 and 192000 Hz" };
+  }
+  if (!Number.isInteger(bitrate) || bitrate < 8000 || bitrate > 320000) {
+    return { error: "bitrate must be an integer between 8000 and 320000 bps" };
+  }
+
+  return {
+    mimeType,
+    channels,
+    channelLayout: "mono",
+    sampleRate,
+    bitrate,
+  };
+}
+
+function getBroadcastState() {
+  return {
+    mode: currentStreamMode,
+    broadcastId: currentBroadcast?.id ?? null,
+    audioFormat: currentBroadcast?.audioFormat ?? null,
+    startedAt: currentBroadcast?.startedAt ?? null,
+  };
+}
+
+function notifyModeListeners() {
+  const payload = `event: mode\ndata: ${JSON.stringify(getBroadcastState())}\n\n`;
+  for (const listener of modeListeners) {
+    if (listener.destroyed || listener.writableEnded) {
+      modeListeners.delete(listener);
+    } else {
+      listener.write(payload);
+    }
+  }
 }
 
 async function readTrackChunk(song, chunk) {
@@ -308,9 +363,22 @@ app.put("/api/queue", (req, res) => {
 
 // Start a live broadcast (interrupts Auto-DJ)
 app.post("/api/live/start", (req, res) => {
+  const audioFormat = getAudioFormat(req.body);
+  if (audioFormat.error) {
+    return res.status(400).json({ error: audioFormat.error });
+  }
+
+  currentBroadcast = {
+    id: randomUUID(),
+    audioFormat,
+    startedAt: new Date().toISOString(),
+  };
   currentStreamMode = "LIVE";
-  liveBroadcastBuffer = [];
-  res.json({ message: "Live broadcast started. Stream mode is now LIVE." });
+  notifyModeListeners();
+  res.status(201).json({
+    message: "Live broadcast started",
+    ...getBroadcastState(),
+  });
 });
 
 // Push audio chunks from your microphone/client during live broadcast
@@ -321,10 +389,22 @@ app.post(
     limit: "5mb",
   }),
   (req, res) => {
-    if (currentStreamMode !== "LIVE") {
+    const broadcastId = getBroadcastId(req);
+    if (!currentBroadcast || currentStreamMode !== "LIVE") {
       return res
-        .status(400)
-        .json({ error: "Station is not currently in LIVE mode" });
+        .status(409)
+        .json({ error: "There is no active live broadcast" });
+    }
+    if (!broadcastId) {
+      return res.status(400).json({
+        error: "X-Broadcast-Id is required for live audio chunks",
+      });
+    }
+    if (broadcastId !== currentBroadcast.id) {
+      return res.status(409).json({
+        error: "This broadcast has ended or has been superseded",
+        activeBroadcastId: currentBroadcast.id,
+      });
     }
 
     const chunk = req.body;
@@ -336,23 +416,71 @@ app.post(
     }
 
     // Broadcast live chunk directly to all connected listeners instantly
+    let listenerCount = 0;
     activeListeners = activeListeners.filter((listenerRes) => {
       if (listenerRes.destroyed || listenerRes.writableEnded) return false;
       listenerRes.write(chunk);
+      listenerCount += 1;
       return true;
     });
 
-    res.sendStatus(200);
+    res.status(200).json({
+      message: "Audio chunk relayed",
+      broadcastId,
+      bytes: chunk.length,
+      listeners: listenerCount,
+    });
   },
 );
 
 // End live broadcast (returns control back to Auto-DJ loop)
 app.post("/api/live/end", (req, res) => {
+  const broadcastId = getBroadcastId(req);
+  if (!broadcastId) {
+    return res.status(400).json({
+      error: "X-Broadcast-Id or broadcastId is required to end a broadcast",
+    });
+  }
+  if (!currentBroadcast || broadcastId !== currentBroadcast.id) {
+    return res.status(409).json({
+      error: "This broadcast has already ended or has been superseded",
+      activeBroadcastId: currentBroadcast?.id ?? null,
+    });
+  }
+
+  const endedBroadcastId = currentBroadcast.id;
+  currentBroadcast = null;
   currentStreamMode = "AUTODJ";
-  res.json({ message: "Live broadcast ended. Returning to Auto-DJ rotation." });
+  notifyModeListeners();
+  res.json({
+    message: "Live broadcast ended. Returning to Auto-DJ rotation.",
+    mode: currentStreamMode,
+    broadcastId: endedBroadcastId,
+  });
 });
 
 // --- 5. THE STREAMING ENDPOINT & AUTO-DJ LOOP ---
+
+// Server-sent events for immediate mode and broadcast state changes
+app.get("/api/events", (req, res) => {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  res.write(`event: mode\ndata: ${JSON.stringify(getBroadcastState())}\n\n`);
+  modeListeners.add(res);
+
+  const heartbeat = setInterval(() => {
+    if (!res.destroyed && !res.writableEnded) res.write(": keep-alive\n\n");
+  }, 25000);
+
+  req.on("close", () => {
+    clearInterval(heartbeat);
+    modeListeners.delete(res);
+  });
+});
 
 // Client listener endpoint
 app.get("/stream", (req, res) => {
