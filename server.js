@@ -13,6 +13,7 @@ admin.initializeApp({
 });
 
 const bucket = admin.storage().bucket();
+const songsCollection = admin.firestore().collection("songs");
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -22,8 +23,8 @@ const upload = multer({ storage: multer.memoryStorage() });
 const MAX_CHUNK_SIZE_BYTES = 512 * 1024;
 const STREAM_PACKET_SIZE_BYTES = 8 * 1024;
 
-// --- IN-MEMORY RADIO STATE ---
-let songLibrary = []; // Array of { id, title, author, filePath, createdAt }
+// --- RADIO STATE ---
+let songLibrary = [];
 let playlistQueue = []; // Array of song IDs representing the upcoming rotation
 let activeListeners = []; // Array of Express response streams connected to /stream
 const modeListeners = new Set();
@@ -49,6 +50,20 @@ function resolveQueueIds(ids) {
   return ids.map((id) => getSongById(id)).filter(Boolean);
 }
 
+function shuffleSongIds(songIds) {
+  const shuffledIds = [...songIds];
+
+  for (let index = shuffledIds.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(Math.random() * (index + 1));
+    [shuffledIds[index], shuffledIds[swapIndex]] = [
+      shuffledIds[swapIndex],
+      shuffledIds[index],
+    ];
+  }
+
+  return shuffledIds;
+}
+
 function serializeSong(song) {
   return {
     ...song,
@@ -62,6 +77,36 @@ function serializeSong(song) {
       }),
     ),
   };
+}
+
+function songDocument(song) {
+  return {
+    name: song.name,
+    title: song.title,
+    author: song.author,
+    createdAt: song.createdAt,
+    durationSeconds: song.durationSeconds,
+    filePath: song.filePath,
+    storageBucket: song.storageBucket,
+    mimeType: song.mimeType,
+    fileSizeBytes: song.fileSizeBytes,
+  };
+}
+
+function restoreSong(id, data) {
+  return {
+    id,
+    ...data,
+    chunks: createTrackChunks(data.fileSizeBytes, data.durationSeconds),
+  };
+}
+
+async function loadSongLibrary() {
+  const snapshot = await songsCollection.get();
+  songLibrary = snapshot.docs
+    .map((document) => restoreSong(document.id, document.data()))
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  playlistQueue = shuffleSongIds(songLibrary.map((song) => song.id));
 }
 
 function createTrackChunks(fileSize, durationSeconds) {
@@ -170,7 +215,6 @@ async function readTrackChunk(song, chunk) {
 // Upload a new song to Firebase and add to library
 app.post("/api/songs", upload.single("audio"), async (req, res) => {
   try {
-    const { title, author } = req.body;
     if (!req.file)
       return res.status(400).json({ error: "No audio file uploaded" });
 
@@ -194,9 +238,10 @@ app.post("/api/songs", upload.single("audio"), async (req, res) => {
         .json({ error: "The uploaded track has no readable duration" });
     }
 
-    const fileId = Date.now().toString();
+    const fileId = randomUUID();
     const fileName = `tracks/${fileId}_${req.file.originalname}`;
     const fileRef = bucket.file(fileName);
+    const trackName = req.body.name || req.body.title || "Unknown Title";
 
     // Upload file buffer to Firebase Storage
     await fileRef.save(req.file.buffer, {
@@ -205,15 +250,26 @@ app.post("/api/songs", upload.single("audio"), async (req, res) => {
 
     const newSong = {
       id: fileId,
-      title: title || "Unknown Title",
-      author: author || "Unknown Artist",
+      name: trackName,
+      title: req.body.title || trackName,
+      author: req.body.author || "Unknown Artist",
       filePath: fileName,
+      storageBucket: bucket.name,
       mimeType: req.file.mimetype,
       fileSizeBytes: req.file.size,
       durationSeconds,
       chunks: createTrackChunks(req.file.size, durationSeconds),
-      createdAt: new Date().toISOString(), // Track when the song was added
+      createdAt: new Date().toISOString(),
     };
+
+    try {
+      await songsCollection.doc(fileId).create(songDocument(newSong));
+    } catch (error) {
+      await fileRef.delete({ ignoreNotFound: true }).catch((cleanupError) => {
+        console.error(`Unable to clean up failed upload ${fileId}:`, cleanupError);
+      });
+      throw error;
+    }
 
     songLibrary.push(newSong);
     playlistQueue.push(fileId); // Automatically add new songs to the end of the queue
@@ -294,17 +350,28 @@ app.get("/api/songs/:id/chunks/:index", (req, res) => {
   fileStream.pipe(res);
 });
 
-// Edit song metadata (title, author)
-app.put("/api/songs/:id", (req, res) => {
-  const { title, author } = req.body;
-  const song = getSongById(req.params.id);
+// Edit song metadata (name, title, author)
+app.put("/api/songs/:id", async (req, res) => {
+  try {
+    const { name, title, author } = req.body;
+    const song = getSongById(req.params.id);
 
-  if (!song) return res.status(404).json({ error: "Song not found" });
+    if (!song) return res.status(404).json({ error: "Song not found" });
 
-  if (title) song.title = title;
-  if (author) song.author = author;
+    const updatedSong = { ...song };
+    if (name !== undefined) updatedSong.name = name;
+    if (title !== undefined) updatedSong.title = title;
+    else if (name !== undefined) updatedSong.title = name;
+    if (author !== undefined) updatedSong.author = author;
 
-  res.json({ message: "Song updated successfully", song: serializeSong(song) });
+    await songsCollection
+      .doc(song.id)
+      .set(songDocument(updatedSong), { merge: true });
+    Object.assign(song, updatedSong);
+    res.json({ message: "Song updated successfully", song: serializeSong(song) });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Remove a song from library and queue
@@ -316,11 +383,8 @@ app.delete("/api/songs/:id", async (req, res) => {
 
     const song = songLibrary[songIndex];
 
-    // Delete from Firebase Storage
-    await bucket
-      .file(song.filePath)
-      .delete()
-      .catch(() => {});
+    await bucket.file(song.filePath).delete({ ignoreNotFound: true });
+    await songsCollection.doc(song.id).delete();
 
     // Remove from library and queue
     songLibrary.splice(songIndex, 1);
@@ -537,10 +601,17 @@ app.get("/api/playback", (req, res) => {
 // Background Auto-DJ Engine Loop
 async function startAutoDJLoop() {
   while (true) {
-    if (currentStreamMode === "LIVE" || playlistQueue.length === 0) {
-      // If live or queue is empty, pause briefly and check again
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+    if (currentStreamMode === "LIVE") {
+      await sleep(1000);
       continue;
+    }
+
+    if (playlistQueue.length === 0) {
+      playlistQueue = shuffleSongIds(songLibrary.map((song) => song.id));
+      if (playlistQueue.length === 0) {
+        await sleep(1000);
+        continue;
+      }
     }
 
     // Pull the next song ID from the queue using our translation helper
@@ -548,9 +619,6 @@ async function startAutoDJLoop() {
     const song = getSongById(nextSongId);
 
     if (!song) continue; // Skip if song was deleted/missing
-
-    // Put it back at the end of the queue for a continuous loop rotation
-    playlistQueue.push(nextSongId);
 
     currentPlayback = {
       songId: song.id,
@@ -614,9 +682,20 @@ async function startAutoDJLoop() {
   }
 }
 
-// Start server and background loop
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Radio backend running on port ${PORT}`);
-  startAutoDJLoop();
-});
+// Load persisted tracks before accepting requests or starting Auto-DJ.
+async function startServer() {
+  try {
+    await loadSongLibrary();
+  } catch (error) {
+    console.error("Unable to load the persisted song library:", error);
+    process.exit(1);
+  }
+
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => {
+    console.log(`Radio backend running on port ${PORT}`);
+    startAutoDJLoop();
+  });
+}
+
+startServer();
