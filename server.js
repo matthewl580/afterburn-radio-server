@@ -13,7 +13,7 @@ admin.initializeApp({
 });
 
 const bucket = admin.storage().bucket();
-const songsCollection = admin.firestore().collection("songs");
+const songLibraryFile = bucket.file("metadata/songs.json");
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -82,6 +82,7 @@ function serializeSong(song) {
 
 function songDocument(song) {
   return {
+    id: song.id,
     name: song.name,
     title: song.title,
     author: song.author,
@@ -127,10 +128,39 @@ function restoreSong(id, data) {
   };
 }
 
+async function saveSongLibrary(songs) {
+  await songLibraryFile.save(
+    JSON.stringify({
+      version: 1,
+      songs: songs.map(songDocument),
+    }),
+    {
+      resumable: false,
+      metadata: { contentType: "application/json" },
+    },
+  );
+}
+
 async function loadSongLibrary() {
-  const snapshot = await songsCollection.get();
-  songLibrary = snapshot.docs
-    .map((document) => restoreSong(document.id, document.data()))
+  let contents;
+  try {
+    [contents] = await songLibraryFile.download();
+  } catch (error) {
+    if (error.code === 404 || error.code === "404") {
+      songLibrary = [];
+      playlistQueue = [];
+      return;
+    }
+    throw error;
+  }
+
+  const catalog = JSON.parse(contents.toString("utf8"));
+  if (!catalog || !Array.isArray(catalog.songs)) {
+    throw new Error("Stored song catalog has an invalid format");
+  }
+
+  songLibrary = catalog.songs
+    .map((song) => restoreSong(song.id, song))
     .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
   playlistQueue = shuffleSongIds(songLibrary.map((song) => song.id));
 }
@@ -289,7 +319,7 @@ app.post("/api/songs", upload.single("audio"), async (req, res) => {
     };
 
     try {
-      await songsCollection.doc(fileId).create(songDocument(newSong));
+      await saveSongLibrary([...songLibrary, newSong]);
     } catch (error) {
       await fileRef.delete({ ignoreNotFound: true }).catch((cleanupError) => {
         console.error(`Unable to clean up failed upload ${fileId}:`, cleanupError);
@@ -392,9 +422,11 @@ app.put("/api/songs/:id", async (req, res) => {
     else if (name !== undefined) updatedSong.title = name;
     if (author !== undefined) updatedSong.author = author;
 
-    await songsCollection
-      .doc(song.id)
-      .set(songDocument(updatedSong), { merge: true });
+    await saveSongLibrary(
+      songLibrary.map((existingSong) =>
+        existingSong.id === song.id ? updatedSong : existingSong,
+      ),
+    );
     Object.assign(song, updatedSong);
     res.json({ message: "Song updated successfully", song: serializeSong(song) });
   } catch (error) {
@@ -411,12 +443,28 @@ app.delete("/api/songs/:id", async (req, res) => {
 
     const song = songLibrary[songIndex];
 
-    await bucket.file(song.filePath).delete({ ignoreNotFound: true });
-    await songsCollection.doc(song.id).delete();
-
-    // Remove from library and queue
+    const updatedLibrary = songLibrary.filter(
+      (existingSong) => existingSong.id !== song.id,
+    );
+    const previousQueue = [...playlistQueue];
+    await saveSongLibrary(updatedLibrary);
     songLibrary.splice(songIndex, 1);
     playlistQueue = playlistQueue.filter((id) => id !== req.params.id);
+    try {
+      await bucket.file(song.filePath).delete({ ignoreNotFound: true });
+    } catch (error) {
+      try {
+        await saveSongLibrary([...songLibrary, song]);
+        songLibrary.push(song);
+        playlistQueue = previousQueue;
+      } catch (rollbackError) {
+        console.error(
+          `Unable to restore catalog after deleting track ${song.id} failed:`,
+          rollbackError,
+        );
+      }
+      throw error;
+    }
 
     res.json({ message: "Song deleted successfully" });
   } catch (error) {
