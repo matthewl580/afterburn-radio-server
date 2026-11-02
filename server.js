@@ -25,6 +25,7 @@ const STREAM_PACKET_SIZE_BYTES = 8 * 1024;
 
 // --- RADIO STATE ---
 let songLibrary = [];
+let tracklistIds = [];
 let playlistQueue = []; // Array of song IDs representing the upcoming rotation
 let activeListeners = []; // Array of Express response streams connected to /stream
 const modeListeners = new Set();
@@ -128,11 +129,12 @@ function restoreSong(id, data) {
   };
 }
 
-async function saveSongLibrary(songs) {
+async function saveSongLibrary(songs, selectedTrackIds = tracklistIds) {
   await songLibraryFile.save(
     JSON.stringify({
       version: 1,
       songs: songs.map(songDocument),
+      tracklistIds: selectedTrackIds,
     }),
     {
       resumable: false,
@@ -148,6 +150,7 @@ async function loadSongLibrary() {
   } catch (error) {
     if (error.code === 404 || error.code === "404") {
       songLibrary = [];
+      tracklistIds = [];
       playlistQueue = [];
       return;
     }
@@ -162,7 +165,15 @@ async function loadSongLibrary() {
   songLibrary = catalog.songs
     .map((song) => restoreSong(song.id, song))
     .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
-  playlistQueue = shuffleSongIds(songLibrary.map((song) => song.id));
+  const libraryIds = new Set(songLibrary.map((song) => song.id));
+  tracklistIds = Array.isArray(catalog.tracklistIds)
+    ? [...new Set(catalog.tracklistIds.filter((id) => libraryIds.has(id)))]
+    : songLibrary.map((song) => song.id);
+  playlistQueue = shuffleSongIds(tracklistIds);
+}
+
+function getTracklist() {
+  return tracklistIds.map((id) => getSongById(id)).filter(Boolean);
 }
 
 function createTrackChunks(fileSize, durationSeconds) {
@@ -319,7 +330,10 @@ app.post("/api/songs", upload.single("audio"), async (req, res) => {
     };
 
     try {
-      await saveSongLibrary([...songLibrary, newSong]);
+      await saveSongLibrary([...songLibrary, newSong], [
+        ...tracklistIds,
+        fileId,
+      ]);
     } catch (error) {
       await fileRef.delete({ ignoreNotFound: true }).catch((cleanupError) => {
         console.error(`Unable to clean up failed upload ${fileId}:`, cleanupError);
@@ -328,6 +342,7 @@ app.post("/api/songs", upload.single("audio"), async (req, res) => {
     }
 
     songLibrary.push(newSong);
+    tracklistIds.push(fileId);
     playlistQueue.push(fileId); // Automatically add new songs to the end of the queue
 
     res
@@ -446,16 +461,20 @@ app.delete("/api/songs/:id", async (req, res) => {
     const updatedLibrary = songLibrary.filter(
       (existingSong) => existingSong.id !== song.id,
     );
+    const updatedTracklistIds = tracklistIds.filter((id) => id !== song.id);
+    const previousTracklistIds = [...tracklistIds];
     const previousQueue = [...playlistQueue];
-    await saveSongLibrary(updatedLibrary);
+    await saveSongLibrary(updatedLibrary, updatedTracklistIds);
     songLibrary.splice(songIndex, 1);
+    tracklistIds = updatedTracklistIds;
     playlistQueue = playlistQueue.filter((id) => id !== req.params.id);
     try {
       await bucket.file(song.filePath).delete({ ignoreNotFound: true });
     } catch (error) {
       try {
-        await saveSongLibrary([...songLibrary, song]);
+        await saveSongLibrary([...songLibrary, song], previousTracklistIds);
         songLibrary.push(song);
+        tracklistIds = previousTracklistIds;
         playlistQueue = previousQueue;
       } catch (rollbackError) {
         console.error(
@@ -497,6 +516,95 @@ app.put("/api/queue", (req, res) => {
   playlistQueue = newQueueIds.filter((id) => getSongById(id) !== null);
 
   res.json({ message: "Queue updated successfully", queue: playlistQueue });
+});
+
+// Get selected tracks and their upcoming shuffled order
+app.get("/api/tracklist", (req, res) => {
+  res.json({
+    tracks: getTracklist().map(serializeSong),
+    trackIds: tracklistIds,
+    queueIds: playlistQueue,
+    currentSongId: currentPlayback?.songId ?? null,
+  });
+});
+
+// Add one or more tracks from the library to the repeating tracklist
+app.post("/api/tracklist", async (req, res) => {
+  const requestedIds = req.body?.songIds ?? [req.body?.songId];
+  if (
+    !Array.isArray(requestedIds) ||
+    requestedIds.length === 0 ||
+    requestedIds.some((id) => typeof id !== "string" || !id)
+  ) {
+    return res.status(400).json({
+      error: "Provide songId or a non-empty songIds array of track IDs",
+    });
+  }
+
+  const uniqueRequestedIds = [...new Set(requestedIds)];
+  const missingIds = uniqueRequestedIds.filter((id) => !getSongById(id));
+  if (missingIds.length > 0) {
+    return res.status(404).json({
+      error: "One or more tracks were not found in the library",
+      songIds: missingIds,
+    });
+  }
+
+  const newIds = uniqueRequestedIds.filter((id) => !tracklistIds.includes(id));
+  if (newIds.length === 0) {
+    return res.json({
+      message: "Tracks are already in the tracklist",
+      tracklist: getTracklist().map(serializeSong),
+      trackIds: tracklistIds,
+    });
+  }
+
+  const updatedTracklistIds = [...tracklistIds, ...newIds];
+  try {
+    await saveSongLibrary(songLibrary, updatedTracklistIds);
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+
+  tracklistIds = updatedTracklistIds;
+  playlistQueue.push(...newIds);
+  res.status(201).json({
+    message: "Tracks added to the tracklist",
+    tracklist: getTracklist().map(serializeSong),
+    trackIds: tracklistIds,
+    queueIds: playlistQueue,
+  });
+});
+
+// Remove a track from the repeating tracklist without deleting it from the library
+app.delete("/api/tracklist/:songId", async (req, res) => {
+  const { songId } = req.params;
+  if (!getSongById(songId)) {
+    return res.status(404).json({ error: "Track not found in library" });
+  }
+  if (!tracklistIds.includes(songId)) {
+    return res.status(404).json({ error: "Track is not in the tracklist" });
+  }
+
+  const updatedTracklistIds = tracklistIds.filter((id) => id !== songId);
+  try {
+    await saveSongLibrary(songLibrary, updatedTracklistIds);
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+
+  tracklistIds = updatedTracklistIds;
+  playlistQueue = playlistQueue.filter((id) => id !== songId);
+  res.json({
+    message:
+      currentPlayback?.songId === songId
+        ? "Track removed from the tracklist; the currently playing track will finish"
+        : "Track removed from the tracklist",
+    tracklist: getTracklist().map(serializeSong),
+    trackIds: tracklistIds,
+    queueIds: playlistQueue,
+    currentSongId: currentPlayback?.songId ?? null,
+  });
 });
 
 // --- 4. LIVE BROADCAST INTERRUPTION API ---
@@ -684,7 +792,7 @@ async function startAutoDJLoop() {
     }
 
     if (playlistQueue.length === 0) {
-      playlistQueue = shuffleSongIds(songLibrary.map((song) => song.id));
+      playlistQueue = shuffleSongIds(tracklistIds);
       if (playlistQueue.length === 0) {
         await sleep(1000);
         continue;
