@@ -67,6 +67,7 @@ function shuffleSongIds(songIds) {
 function serializeSong(song) {
   return {
     ...song,
+    chunkCount: song.chunks.length,
     chunks: song.chunks.map(
       ({ index, sizeBytes, startSeconds, durationSeconds }) => ({
         index,
@@ -90,14 +91,39 @@ function songDocument(song) {
     storageBucket: song.storageBucket,
     mimeType: song.mimeType,
     fileSizeBytes: song.fileSizeBytes,
+    chunkCount: song.chunks.length,
+    chunks: song.chunks.map(
+      ({
+        index,
+        startByte,
+        endByte,
+        sizeBytes,
+        startSeconds,
+        durationSeconds,
+      }) => ({
+        index,
+        startByte,
+        endByte,
+        sizeBytes,
+        startSeconds,
+        durationSeconds,
+      }),
+    ),
   };
 }
 
 function restoreSong(id, data) {
+  const chunks =
+    Array.isArray(data.chunks) && data.chunks.length > 0
+      ? data.chunks
+      : createTrackChunks(data.fileSizeBytes, data.durationSeconds);
+
   return {
     id,
     ...data,
-    chunks: createTrackChunks(data.fileSizeBytes, data.durationSeconds),
+    name: data.name || data.title || "Unknown Title",
+    chunks,
+    chunkCount: chunks.length,
   };
 }
 
@@ -335,6 +361,8 @@ app.get("/api/songs/:id/chunks/:index", (req, res) => {
     "X-Track-Duration-Seconds": String(song.durationSeconds),
     "X-Track-Position-Seconds": String(startSeconds),
     "X-Clip-Index": String(chunk.index),
+    "X-Chunk-Count": String(song.chunks.length),
+    "X-Chunk-Size-Bytes": String(chunk.sizeBytes),
     "X-Clip-Start-Seconds": String(startSeconds),
     "X-Clip-Duration-Seconds": String(remainingDurationSeconds),
   });
@@ -590,6 +618,7 @@ app.get("/api/playback", (req, res) => {
     nextChunkIndex: currentPlayback?.nextChunkIndex ?? null,
     positionSeconds: currentPlayback?.positionSeconds ?? 0,
     chunkOffsetBytes: nextChunk ? nextChunkOffsetBytes : null,
+    chunkCount: song?.chunks.length ?? 0,
     chunkDurationSeconds: nextChunkDurationSeconds,
     chunkUrl:
       song && nextChunk
@@ -624,6 +653,7 @@ async function startAutoDJLoop() {
       songId: song.id,
       currentChunkIndex: null,
       nextChunkIndex: 0,
+      nextChunkOffsetBytes: 0,
       positionSeconds: 0,
     };
 
@@ -636,7 +666,7 @@ async function startAutoDJLoop() {
         let offsetBytes =
           currentPlayback?.songId === song.id &&
           currentPlayback.nextChunkIndex === chunk.index
-            ? currentPlayback.nextChunkOffsetBytes
+            ? currentPlayback.nextChunkOffsetBytes ?? 0
             : 0;
         const averageBytesPerSecond = song.fileSizeBytes / song.durationSeconds;
 
