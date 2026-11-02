@@ -19,6 +19,7 @@ app.use(express.json());
 // Multer configuration to handle temporary file uploads for songs
 const upload = multer({ storage: multer.memoryStorage() });
 const MAX_CHUNK_SIZE_BYTES = 512 * 1024;
+const STREAM_PACKET_SIZE_BYTES = 8 * 1024;
 
 // --- IN-MEMORY RADIO STATE ---
 let songLibrary = []; // Array of { id, title, author, filePath, createdAt }
@@ -82,6 +83,10 @@ function createTrackChunks(fileSize, durationSeconds) {
   }
 
   return chunks;
+}
+
+function sleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 async function readTrackChunk(song, chunk) {
@@ -191,20 +196,36 @@ app.get("/api/songs/:id/chunks/:index", (req, res) => {
   const chunk = song.chunks[chunkIndex];
   if (!chunk) return res.status(404).json({ error: "Clip not found" });
 
+  const offsetBytes = Number(req.query.offsetBytes || 0);
+  if (
+    !Number.isInteger(offsetBytes) ||
+    offsetBytes < 0 ||
+    offsetBytes >= chunk.sizeBytes
+  ) {
+    return res.status(400).json({ error: "Invalid clip byte offset" });
+  }
+
+  const startByte = chunk.startByte + offsetBytes;
+  const startSeconds =
+    chunk.startSeconds +
+    (offsetBytes / chunk.sizeBytes) * chunk.durationSeconds;
+  const remainingSizeBytes = chunk.sizeBytes - offsetBytes;
+  const remainingDurationSeconds =
+    chunk.durationSeconds - (startSeconds - chunk.startSeconds);
   const fileStream = bucket.file(song.filePath).createReadStream({
-    start: chunk.startByte,
+    start: startByte,
     end: chunk.endByte,
   });
 
   res.status(200).set({
     "Content-Type": song.mimeType || "application/octet-stream",
-    "Content-Length": chunk.sizeBytes,
+    "Content-Length": remainingSizeBytes,
     "X-Track-Id": song.id,
     "X-Track-Duration-Seconds": String(song.durationSeconds),
-    "X-Track-Position-Seconds": String(chunk.startSeconds),
+    "X-Track-Position-Seconds": String(startSeconds),
     "X-Clip-Index": String(chunk.index),
-    "X-Clip-Start-Seconds": String(chunk.startSeconds),
-    "X-Clip-Duration-Seconds": String(chunk.durationSeconds),
+    "X-Clip-Start-Seconds": String(startSeconds),
+    "X-Clip-Duration-Seconds": String(remainingDurationSeconds),
   });
 
   fileStream.on("error", (error) => {
@@ -295,7 +316,10 @@ app.post("/api/live/start", (req, res) => {
 // Push audio chunks from your microphone/client during live broadcast
 app.post(
   "/api/live/chunk",
-  express.raw({ type: "audio/mpeg", limit: "5mb" }),
+  express.raw({
+    type: ["audio/mpeg", "audio/mp3", "application/octet-stream"],
+    limit: "5mb",
+  }),
   (req, res) => {
     if (currentStreamMode !== "LIVE") {
       return res
@@ -304,9 +328,18 @@ app.post(
     }
 
     const chunk = req.body;
+    if (!Buffer.isBuffer(chunk) || chunk.length === 0) {
+      return res.status(400).json({
+        error:
+          "Expected a non-empty MPEG audio chunk with Content-Type audio/mpeg, audio/mp3, or application/octet-stream",
+      });
+    }
+
     // Broadcast live chunk directly to all connected listeners instantly
-    activeListeners.forEach((listenerRes) => {
+    activeListeners = activeListeners.filter((listenerRes) => {
+      if (listenerRes.destroyed || listenerRes.writableEnded) return false;
       listenerRes.write(chunk);
+      return true;
     });
 
     res.sendStatus(200);
@@ -344,6 +377,11 @@ app.get("/api/playback", (req, res) => {
     song && currentPlayback.nextChunkIndex !== null
       ? song.chunks[currentPlayback.nextChunkIndex]
       : null;
+  const nextChunkOffsetBytes = currentPlayback?.nextChunkOffsetBytes ?? 0;
+  const nextChunkDurationSeconds = nextChunk
+    ? nextChunk.durationSeconds *
+      ((nextChunk.sizeBytes - nextChunkOffsetBytes) / nextChunk.sizeBytes)
+    : null;
 
   res.json({
     mode: currentStreamMode,
@@ -359,10 +397,11 @@ app.get("/api/playback", (req, res) => {
     currentChunkIndex: currentPlayback?.currentChunkIndex ?? null,
     nextChunkIndex: currentPlayback?.nextChunkIndex ?? null,
     positionSeconds: currentPlayback?.positionSeconds ?? 0,
-    chunkDurationSeconds: nextChunk?.durationSeconds ?? null,
+    chunkOffsetBytes: nextChunk ? nextChunkOffsetBytes : null,
+    chunkDurationSeconds: nextChunkDurationSeconds,
     chunkUrl:
       song && nextChunk
-        ? `/api/songs/${song.id}/chunks/${nextChunk.index}`
+        ? `/api/songs/${song.id}/chunks/${nextChunk.index}?offsetBytes=${nextChunkOffsetBytes}`
         : null,
   });
 });
@@ -397,26 +436,47 @@ async function startAutoDJLoop() {
         `Auto-DJ Streaming: ${song.title} by ${song.author} (ID: ${song.id}, Added: ${song.createdAt})`,
       );
       for (const chunk of song.chunks) {
-        while (currentStreamMode === "LIVE") {
-          await new Promise((resolve) => setTimeout(resolve, 500));
-        }
-
         const clipBuffer = await readTrackChunk(song, chunk);
+        let offsetBytes =
+          currentPlayback?.songId === song.id &&
+          currentPlayback.nextChunkIndex === chunk.index
+            ? currentPlayback.nextChunkOffsetBytes
+            : 0;
+        const averageBytesPerSecond = song.fileSizeBytes / song.durationSeconds;
 
-        // Keep the entire clip pending until the live broadcast has finished.
-        while (currentStreamMode === "LIVE") {
-          await new Promise((resolve) => setTimeout(resolve, 500));
+        while (offsetBytes < clipBuffer.length) {
+          while (currentStreamMode === "LIVE") {
+            await sleep(100);
+          }
+
+          const packetEnd = Math.min(
+            offsetBytes + STREAM_PACKET_SIZE_BYTES,
+            clipBuffer.length,
+          );
+          const packet = clipBuffer.subarray(offsetBytes, packetEnd);
+          activeListeners = activeListeners.filter((listenerRes) => {
+            if (listenerRes.destroyed || listenerRes.writableEnded) return false;
+            listenerRes.write(packet);
+            return true;
+          });
+          offsetBytes = packetEnd;
+
+          const chunkComplete = offsetBytes === clipBuffer.length;
+          const nextChunk = chunkComplete ? song.chunks[chunk.index + 1] : chunk;
+          currentPlayback = {
+            songId: song.id,
+            currentChunkIndex: chunk.index,
+            nextChunkIndex: nextChunk ? nextChunk.index : null,
+            nextChunkOffsetBytes: chunkComplete ? 0 : offsetBytes,
+            positionSeconds:
+              ((chunk.startByte + offsetBytes) / song.fileSizeBytes) *
+              song.durationSeconds,
+          };
+
+          if (!chunkComplete) {
+            await sleep((packet.length / averageBytesPerSecond) * 1000);
+          }
         }
-
-        activeListeners.forEach((listenerRes) => {
-          listenerRes.write(clipBuffer);
-        });
-        currentPlayback = {
-          songId: song.id,
-          currentChunkIndex: chunk.index,
-          nextChunkIndex: chunk.index + 1,
-          positionSeconds: chunk.startSeconds + chunk.durationSeconds,
-        };
       }
       currentPlayback = null;
     } catch (err) {
