@@ -30,6 +30,7 @@ let playlistQueue = []; // Array of song IDs representing the upcoming rotation
 let activeListeners = []; // Array of Express response streams connected to /stream
 const modeListeners = new Set();
 let currentPlayback = null; // { songId, currentChunkIndex, nextChunkIndex, positionSeconds }
+let skipRequestedSongId = null;
 
 let currentStreamMode = "AUTODJ"; // 'AUTODJ' or 'LIVE'
 let currentBroadcast = null;
@@ -252,6 +253,17 @@ function notifyModeListeners() {
       modeListeners.delete(listener);
     } else {
       listener.write(payload);
+    }
+  }
+}
+
+function notifyPlaybackListeners(payload) {
+  const message = `event: playback\ndata: ${JSON.stringify(payload)}\n\n`;
+  for (const listener of modeListeners) {
+    if (listener.destroyed || listener.writableEnded) {
+      modeListeners.delete(listener);
+    } else {
+      listener.write(message);
     }
   }
 }
@@ -783,6 +795,51 @@ app.get("/api/playback", (req, res) => {
   });
 });
 
+// Skip the current Auto-DJ track and continue with the next queued track
+app.post("/api/playback/skip", (req, res) => {
+  if (currentStreamMode === "LIVE") {
+    return res.status(409).json({
+      error: "Cannot skip an Auto-DJ track during a live broadcast",
+      mode: currentStreamMode,
+    });
+  }
+
+  if (!currentPlayback) {
+    return res.status(409).json({ error: "There is no track currently playing" });
+  }
+
+  const song = getSongById(currentPlayback.songId);
+  if (!song) {
+    return res.status(409).json({ error: "The current track is no longer available" });
+  }
+
+  if (skipRequestedSongId === song.id) {
+    return res.status(202).json({
+      message: "Skip already requested",
+      skippingSongId: song.id,
+      skippingSong: {
+        id: song.id,
+        name: song.name,
+        title: song.title,
+        author: song.author,
+      },
+    });
+  }
+
+  skipRequestedSongId = song.id;
+  res.status(202).json({
+    message: "Track skip requested",
+    skippingSongId: song.id,
+    skippingSong: {
+      id: song.id,
+      name: song.name,
+      title: song.title,
+      author: song.author,
+    },
+    nextSongId: playlistQueue[0] ?? null,
+  });
+});
+
 // Background Auto-DJ Engine Loop
 async function startAutoDJLoop() {
   while (true) {
@@ -817,8 +874,10 @@ async function startAutoDJLoop() {
       console.log(
         `Auto-DJ Streaming: ${song.title} by ${song.author} (ID: ${song.id}, Added: ${song.createdAt})`,
       );
-      for (const chunk of song.chunks) {
+      trackPlayback: for (const chunk of song.chunks) {
         const clipBuffer = await readTrackChunk(song, chunk);
+        if (skipRequestedSongId === song.id) break trackPlayback;
+
         let offsetBytes =
           currentPlayback?.songId === song.id &&
           currentPlayback.nextChunkIndex === chunk.index
@@ -828,8 +887,10 @@ async function startAutoDJLoop() {
 
         while (offsetBytes < clipBuffer.length) {
           while (currentStreamMode === "LIVE") {
+            if (skipRequestedSongId === song.id) break trackPlayback;
             await sleep(100);
           }
+          if (skipRequestedSongId === song.id) break trackPlayback;
 
           const packetEnd = Math.min(
             offsetBytes + STREAM_PACKET_SIZE_BYTES,
@@ -860,10 +921,21 @@ async function startAutoDJLoop() {
           }
         }
       }
+      if (skipRequestedSongId === song.id) {
+        skipRequestedSongId = null;
+        notifyPlaybackListeners({
+          type: "track_skipped",
+          songId: song.id,
+          nextSongId: playlistQueue[0] ?? null,
+        });
+      }
       currentPlayback = null;
     } catch (err) {
       console.error(`Error streaming track ${song.title}:`, err);
-      if (currentPlayback?.songId === song.id) currentPlayback = null;
+      if (currentPlayback?.songId === song.id) {
+        currentPlayback = null;
+        if (skipRequestedSongId === song.id) skipRequestedSongId = null;
+      }
     }
   }
 }
